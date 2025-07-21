@@ -5,13 +5,13 @@ const cors = require("cors");
 const axios = require("axios");
 const mongoose = require("mongoose");
 const User = require("./models/userModel");
+const optinRoute = require("./routes/optin"); // 👈 Add this line
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Enhanced CORS configuration for production
 app.use(cors({
-  origin: process.env.NODE_ENV === 'production' 
+  origin: process.env.NODE_ENV === 'production'
     ? process.env.CORS_ORIGIN?.split(',') || ["https://yourdomain.com"]
     : process.env.CORS_ORIGIN || "*",
   credentials: true,
@@ -22,7 +22,6 @@ app.use(cors({
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 
-// Enhanced request logging with environment check
 app.use((req, res, next) => {
   if (process.env.NODE_ENV !== 'production' || process.env.ENABLE_LOGGING === 'true') {
     console.log(`${new Date().toISOString()} - ${req.method} ${req.path} - IP: ${req.ip}`);
@@ -30,10 +29,10 @@ app.use((req, res, next) => {
   next();
 });
 
-// Trust proxy for Render deployment
 app.set('trust proxy', 1);
 
-// OTP Store and Rate Limiting (consider Redis for production scaling)
+app.use('/api/optin', optinRoute); // 👈 Mount opt-in route here
+
 const otpStore = new Map();
 const rateLimitStore = new Map();
 
@@ -78,10 +77,6 @@ const sendWhatsAppOtpGupshup = async (phone, otp) => {
       OTP_EXPIRY_MINUTES = 5
     } = process.env;
 
-    if (!GUPSHUP_API_KEY || !GUPSHUP_SENDER || !GUPSHUP_TEMPLATE_NAME) {
-      throw new Error("Gupshup credentials or template name missing");
-    }
-
     const formattedPhone = phone.startsWith('91') ? phone : `91${phone}`;
 
     const payload = new URLSearchParams({
@@ -117,18 +112,13 @@ const sendWhatsAppOtpGupshup = async (phone, otp) => {
 
   } catch (error) {
     console.error("Gupshup API Error:", error.response?.data || error.message);
-    
     if (error.response) {
       const msg = error.response.data?.message || "Invalid parameters";
       switch (error.response.status) {
-        case 401:
-          throw new Error("Invalid Gupshup API key");
-        case 400:
-          throw new Error(`Bad request: ${msg}`);
-        case 429:
-          throw new Error("Rate limit exceeded on Gupshup API");
-        case 500:
-          throw new Error("Gupshup server error");
+        case 401: throw new Error("Invalid Gupshup API key");
+        case 400: throw new Error(`Bad request: ${msg}`);
+        case 429: throw new Error("Rate limit exceeded on Gupshup API");
+        case 500: throw new Error("Gupshup server error");
       }
     } else if (error.request) {
       throw new Error("No response from Gupshup API - network issue");
@@ -137,10 +127,9 @@ const sendWhatsAppOtpGupshup = async (phone, otp) => {
   }
 };
 
-// Enhanced Health Check
+// Health check
 app.get("/health", (req, res) => {
   const mongoStatus = mongoose.connection.readyState === 1 ? 'Connected' : 'Disconnected';
-  
   res.json({
     status: "OK",
     timestamp: new Date().toISOString(),
@@ -157,76 +146,57 @@ app.get("/health", (req, res) => {
   });
 });
 
-// Root Route
 app.get("/", (req, res) => {
-  res.json({ 
+  res.json({
     message: "🚀 OTP Backend is live!",
     version: "1.0.0",
-    endpoints: ["/health", "/send-otp"]
+    endpoints: ["/health", "/send-otp", "/verify-otp", "/api/optin"]
   });
 });
 
-// Send OTP Endpoint with enhanced error handling
 app.post("/send-otp", async (req, res) => {
   try {
     const { phone, consentGiven } = req.body;
 
-    // Input validation
     if (!phone) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Phone number is required",
-        code: "MISSING_PHONE"
-      });
+      return res.status(400).json({ success: false, message: "Phone number is required", code: "MISSING_PHONE" });
     }
 
     const normalizedPhone = phone.replace(/\D/g, '').replace(/^91/, '');
 
     if (!validatePhoneNumber(normalizedPhone)) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Invalid Indian phone number format",
-        code: "INVALID_PHONE"
-      });
+      return res.status(400).json({ success: false, message: "Invalid Indian phone number format", code: "INVALID_PHONE" });
     }
 
     if (!consentGiven) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "User consent is required",
-        code: "CONSENT_REQUIRED"
-      });
+      return res.status(400).json({ success: false, message: "User consent is required", code: "CONSENT_REQUIRED" });
     }
 
-    // Rate limiting
+    // Register WhatsApp opt-in (non-blocking)
+    try {
+      await axios.post(`${process.env.BACKEND_BASE_URL || 'http://localhost:3001'}/api/optin`, {
+        phone: normalizedPhone
+      });
+    } catch (optinErr) {
+      console.warn("⚠️ Gupshup opt-in failed (continuing):", optinErr.message);
+    }
+
     if (!checkRateLimit(normalizedPhone)) {
-      return res.status(429).json({ 
-        success: false, 
-        message: "Too many OTP requests. Try again in 1 hour.",
-        code: "RATE_LIMITED"
-      });
+      return res.status(429).json({ success: false, message: "Too many OTP requests. Try again in 1 hour.", code: "RATE_LIMITED" });
     }
 
-    // Generate and store OTP
     const otp = generateOTP();
     const expiresAt = Date.now() + (parseInt(process.env.OTP_EXPIRY_MINUTES) || 5) * 60 * 1000;
 
-    otpStore.set(normalizedPhone, { 
-      otp, 
-      expiresAt, 
-      attempts: 0, 
-      createdAt: Date.now() 
-    });
+    otpStore.set(normalizedPhone, { otp, expiresAt, attempts: 0, createdAt: Date.now() });
 
-    // Send OTP via WhatsApp
     const sendResult = await sendWhatsAppOtpGupshup(normalizedPhone, otp);
 
-    // Update or create user in database
     try {
       await User.findOneAndUpdate(
         { phone: normalizedPhone },
-        { 
-          phone: normalizedPhone, 
+        {
+          phone: normalizedPhone,
           termsAccepted: true,
           lastOtpRequest: new Date()
         },
@@ -234,7 +204,6 @@ app.post("/send-otp", async (req, res) => {
       );
     } catch (dbError) {
       console.error("Database error (non-critical):", dbError);
-      // Continue execution as OTP was sent successfully
     }
 
     res.json({
@@ -247,81 +216,52 @@ app.post("/send-otp", async (req, res) => {
 
   } catch (error) {
     console.error("❌ Error in /send-otp:", error);
-    
-    // Send appropriate error response
-    const statusCode = error.message.includes("Rate limit") ? 429 : 
-                      error.message.includes("Invalid") ? 400 : 500;
-    
-    res.status(statusCode).json({ 
-      success: false, 
-      message: error.message || "Failed to send OTP",
-      code: "OTP_SEND_FAILED"
-    });
+    const statusCode = error.message.includes("Rate limit") ? 429 :
+      error.message.includes("Invalid") ? 400 : 500;
+    res.status(statusCode).json({ success: false, message: error.message || "Failed to send OTP", code: "OTP_SEND_FAILED" });
   }
 });
 
-// Add verify OTP endpoint (missing from original)
 app.post("/verify-otp", async (req, res) => {
   try {
     const { phone, otp } = req.body;
 
     if (!phone || !otp) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Phone number and OTP are required",
-        code: "MISSING_CREDENTIALS"
-      });
+      return res.status(400).json({ success: false, message: "Phone number and OTP are required", code: "MISSING_CREDENTIALS" });
     }
 
     const normalizedPhone = phone.replace(/\D/g, '').replace(/^91/, '');
     const storedOtpData = otpStore.get(normalizedPhone);
 
     if (!storedOtpData) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "OTP not found or expired",
-        code: "OTP_NOT_FOUND"
-      });
+      return res.status(400).json({ success: false, message: "OTP not found or expired", code: "OTP_NOT_FOUND" });
     }
 
     if (storedOtpData.expiresAt < Date.now()) {
       otpStore.delete(normalizedPhone);
-      return res.status(400).json({ 
-        success: false, 
-        message: "OTP has expired",
-        code: "OTP_EXPIRED"
-      });
+      return res.status(400).json({ success: false, message: "OTP has expired", code: "OTP_EXPIRED" });
     }
 
     if (storedOtpData.attempts >= 3) {
       otpStore.delete(normalizedPhone);
-      return res.status(400).json({ 
-        success: false, 
-        message: "Too many invalid attempts",
-        code: "MAX_ATTEMPTS_EXCEEDED"
-      });
+      return res.status(400).json({ success: false, message: "Too many invalid attempts", code: "MAX_ATTEMPTS_EXCEEDED" });
     }
 
     if (storedOtpData.otp !== otp) {
       storedOtpData.attempts++;
-      return res.status(400).json({ 
-        success: false, 
+      return res.status(400).json({
+        success: false,
         message: "Invalid OTP",
         code: "INVALID_OTP",
         attemptsLeft: 3 - storedOtpData.attempts
       });
     }
 
-    // OTP verified successfully
     otpStore.delete(normalizedPhone);
-    
-    // Update user verification status
+
     await User.findOneAndUpdate(
       { phone: normalizedPhone },
-      { 
-        isVerified: true,
-        verifiedAt: new Date()
-      }
+      { isVerified: true, verifiedAt: new Date() }
     );
 
     res.json({
@@ -332,37 +272,28 @@ app.post("/verify-otp", async (req, res) => {
 
   } catch (error) {
     console.error("❌ Error in /verify-otp:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Failed to verify OTP",
-      code: "VERIFICATION_FAILED"
-    });
+    res.status(500).json({ success: false, message: "Failed to verify OTP", code: "VERIFICATION_FAILED" });
   }
 });
 
-// 404 Handler
 app.use("*", (req, res) => {
-  res.status(404).json({ 
-    success: false, 
+  res.status(404).json({
+    success: false,
     message: "Endpoint not found",
-    availableEndpoints: ["/", "/health", "/send-otp", "/verify-otp"]
+    availableEndpoints: ["/", "/health", "/send-otp", "/verify-otp", "/api/optin"]
   });
 });
 
-// Global Error Handler
 app.use((error, req, res, next) => {
   console.error("Unhandled error:", error);
   res.status(500).json({
     success: false,
-    message: process.env.NODE_ENV === 'production' ? 
-      "Internal server error" : error.message
+    message: process.env.NODE_ENV === 'production' ? "Internal server error" : error.message
   });
 });
 
-// Graceful Shutdown
 const gracefulShutdown = (signal) => {
   console.log(`🛑 Received ${signal}. Starting graceful shutdown...`);
-  
   mongoose.connection.close(false, () => {
     console.log('📦 MongoDB connection closed.');
     process.exit(0);
@@ -372,22 +303,19 @@ const gracefulShutdown = (signal) => {
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
-// MongoDB Connection with better error handling
 const connectDB = async () => {
   try {
     const mongoOptions = {
       maxPoolSize: 10,
       serverSelectionTimeoutMS: 5000,
       socketTimeoutMS: 45000,
-      family: 4, // Use IPv4
+      family: 4,
       retryWrites: true,
       w: 'majority'
     };
 
     await mongoose.connect(process.env.MONGO_URI, mongoOptions);
     console.log(`✅ Connected to MongoDB Atlas`);
-    
-    // Start server only after successful DB connection
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`🚀 Server running on port ${PORT}`);
       console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
@@ -399,18 +327,8 @@ const connectDB = async () => {
   }
 };
 
-// Handle MongoDB connection events
-mongoose.connection.on('error', (err) => {
-  console.error('MongoDB connection error:', err);
-});
+mongoose.connection.on('error', (err) => console.error('MongoDB connection error:', err));
+mongoose.connection.on('disconnected', () => console.log('MongoDB disconnected'));
+mongoose.connection.on('reconnected', () => console.log('MongoDB reconnected'));
 
-mongoose.connection.on('disconnected', () => {
-  console.log('MongoDB disconnected');
-});
-
-mongoose.connection.on('reconnected', () => {
-  console.log('MongoDB reconnected');
-});
-
-// Start the application
 connectDB();
