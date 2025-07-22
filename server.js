@@ -5,7 +5,7 @@ const cors = require("cors");
 const axios = require("axios");
 const mongoose = require("mongoose");
 const User = require("./models/userModel");
-const optinRoute = require("./routes/optin"); // 👈 Add this line
+const { router: optinRoute, registerOptIn } = require("./routes/optin"); // Updated import
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -31,7 +31,7 @@ app.use((req, res, next) => {
 
 app.set('trust proxy', 1);
 
-app.use('/api/optin', optinRoute); // 👈 Mount opt-in route here
+app.use('/api/optin', optinRoute);
 
 const otpStore = new Map();
 const rateLimitStore = new Map();
@@ -127,6 +127,20 @@ const sendWhatsAppOtpGupshup = async (phone, otp) => {
   }
 };
 
+// Environment variable validation
+const requiredEnvVars = [
+  'GUPSHUP_API_KEY', 
+  'GUPSHUP_SENDER', 
+  'GUPSHUP_APP_NAME',
+  'MONGO_URI'
+];
+
+const missingVars = requiredEnvVars.filter(v => !process.env[v]);
+if (missingVars.length > 0) {
+  console.error(`❌ Missing required environment variables: ${missingVars.join(', ')}`);
+  console.warn("⚠️ Some functionality may be disabled");
+}
+
 // Health check
 app.get("/health", (req, res) => {
   const mongoStatus = mongoose.connection.readyState === 1 ? 'Connected' : 'Disconnected';
@@ -140,7 +154,8 @@ app.get("/health", (req, res) => {
     services: {
       gupshup_api_key: process.env.GUPSHUP_API_KEY ? 'Configured' : 'Missing',
       gupshup_sender: process.env.GUPSHUP_SENDER ? 'Configured' : 'Missing',
-      gupshup_template: process.env.GUPSHUP_TEMPLATE_NAME || 'otp_verification_code',
+      gupshup_app_name: process.env.GUPSHUP_APP_NAME ? 'Configured' : 'Missing',
+      gupshup_template: process.env.GUPSHUP_TEMPLATE_NAME || 'verify_template',
       mongodb_uri: process.env.MONGO_URI ? 'Configured' : 'Missing'
     }
   });
@@ -172,11 +187,10 @@ app.post("/send-otp", async (req, res) => {
       return res.status(400).json({ success: false, message: "User consent is required", code: "CONSENT_REQUIRED" });
     }
 
-    // Register WhatsApp opt-in (non-blocking)
+    // Register WhatsApp opt-in using direct function call (non-blocking)
     try {
-      await axios.post(`${process.env.BACKEND_BASE_URL || 'http://localhost:3001'}/api/optin`, {
-        phone: normalizedPhone
-      });
+      await registerOptIn(normalizedPhone);
+      console.log("✅ WhatsApp opt-in registered successfully");
     } catch (optinErr) {
       console.warn("⚠️ Gupshup opt-in failed (continuing):", optinErr.message);
     }
@@ -319,6 +333,8 @@ const connectDB = async () => {
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`🚀 Server running on port ${PORT}`);
       console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
+      console.log(`📱 Gupshup App: ${process.env.GUPSHUP_APP_NAME || 'Not configured'}`);
+      console.log(`📞 Gupshup Sender: ${process.env.GUPSHUP_SENDER || 'Not configured'}`);
     });
 
   } catch (error) {
